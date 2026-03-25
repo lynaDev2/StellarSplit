@@ -36,4 +36,8 @@ pub enum Error {
     NotInitialized = 8,
     PairNotRegistered = 9,
     RateNotAvailable = 10,
+    PathExpired = 11,
+    UnsupportedAsset = 12,
+    AmountTooLow = 13,
+    AmountTooHigh = 14,
 }
