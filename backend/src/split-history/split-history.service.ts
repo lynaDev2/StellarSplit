@@ -3,6 +3,9 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { SplitHistory, SplitRole } from './entities/split-history.entity';
 import { SplitArchive } from '../modules/archiving/entities/split-archive.entity';
+import { HistoryQueryDto, HistoryStatusFilter } from './dto/history-query.dto';
+import { HistoryResponseDto, HistoryItemDto, HistorySummaryDto } from './dto/history-response.dto';
+import { ExportFormat } from '../export/entities/export-job.entity';
 
 @Injectable()
 export class SplitHistoryService {
@@ -179,5 +182,147 @@ export class SplitHistoryService {
     };
   }
 
+  /**
+   * Paginated, filtered history endpoint — the intentional frontend contract.
+   * Merges SplitHistory records (completed splits) with SplitArchive records,
+   * applies role/status/search/date filters, then paginates in-memory after
+   * fetching only the relevant DB rows.
+   */
+  async getHistory(wallet: string, query: HistoryQueryDto): Promise<HistoryResponseDto> {
+    const { role, status, search, dateFrom, dateTo, page, limit } = query;
 
+    // ── 1. Query SplitHistory (completed/settled records) ──────────────────
+    const qb = this.repo.createQueryBuilder('sh')
+      .leftJoinAndSelect('sh.split', 'split')
+      .where('sh.userId = :wallet', { wallet });
+
+    if (role) {
+      qb.andWhere('sh.role = :role', { role });
+    }
+
+    if (status && status !== HistoryStatusFilter.ALL && status !== HistoryStatusFilter.ARCHIVED) {
+      qb.andWhere('split.status = :status', { status });
+    }
+
+    if (search) {
+      qb.andWhere(
+        '(split.description ILIKE :search OR CAST(sh.splitId AS text) ILIKE :search)',
+        { search: `%${search}%` },
+      );
+    }
+
+    if (dateFrom) {
+      qb.andWhere('sh.completionTime >= :dateFrom', { dateFrom: new Date(dateFrom) });
+    }
+
+    if (dateTo) {
+      qb.andWhere('sh.completionTime <= :dateTo', { dateTo: new Date(dateTo) });
+    }
+
+    const dbRecords = await qb.orderBy('sh.completionTime', 'DESC').getMany();
+
+    // ── 2. Query SplitArchive when status is ALL or ARCHIVED ───────────────
+    let archiveItems: HistoryItemDto[] = [];
+    const includeArchived = !status || status === HistoryStatusFilter.ALL || status === HistoryStatusFilter.ARCHIVED;
+
+    if (includeArchived) {
+      let archiveQb = this.archiveRepo.createQueryBuilder('archive')
+        .where(`archive.splitData ->> 'creatorWalletAddress' = :wallet`, { wallet })
+        .orWhere(`archive.participantData @> :participant`, {
+          participant: JSON.stringify([{ walletAddress: wallet }]),
+        });
+
+      if (dateFrom) {
+        archiveQb = archiveQb.andWhere('archive.archivedAt >= :dateFrom', { dateFrom: new Date(dateFrom) });
+      }
+      if (dateTo) {
+        archiveQb = archiveQb.andWhere('archive.archivedAt <= :dateTo', { dateTo: new Date(dateTo) });
+      }
+
+      const archives = await archiveQb.orderBy('archive.archivedAt', 'DESC').getMany();
+
+      archiveItems = archives
+        .filter((archive) => {
+          if (!search) return true;
+          const desc: string = archive.splitData?.description ?? '';
+          return (
+            desc.toLowerCase().includes(search.toLowerCase()) ||
+            archive.originalSplitId.includes(search)
+          );
+        })
+        .map((archive): HistoryItemDto => {
+          const isCreator = archive.splitData.creatorWalletAddress === wallet;
+          const participant = archive.participantData.find((p: any) => p.walletAddress === wallet);
+          const itemRole = isCreator ? SplitRole.CREATOR : SplitRole.PARTICIPANT;
+
+          // Skip if role filter doesn't match
+          if (role && itemRole !== role) return null as any;
+
+          const rawAmount = isCreator
+            ? Number(archive.splitData.totalAmount ?? 0)
+            : -(Number(participant?.amountOwed ?? 0));
+
+          return {
+            id: archive.id,
+            splitId: archive.originalSplitId,
+            role: itemRole,
+            finalAmount: rawAmount,
+            status: 'archived',
+            description: archive.splitData?.description,
+            preferredCurrency: archive.splitData?.preferredCurrency,
+            totalAmount: Number(archive.splitData?.totalAmount ?? 0),
+            completionTime: archive.archivedAt,
+            comment: archive.archiveReason,
+            isArchived: true,
+          };
+        })
+        .filter(Boolean);
+    }
+
+    // ── 3. Map DB records to HistoryItemDto ────────────────────────────────
+    const dbItems: HistoryItemDto[] = dbRecords.map((sh): HistoryItemDto => ({
+      id: sh.id,
+      splitId: sh.splitId,
+      role: sh.role,
+      finalAmount: Number(sh.finalAmount),
+      status: sh.split?.status ?? 'completed',
+      description: sh.split?.description,
+      preferredCurrency: sh.split?.preferredCurrency,
+      totalAmount: Number(sh.split?.totalAmount ?? 0),
+      completionTime: sh.completionTime,
+      comment: sh.comment,
+      isArchived: false,
+    }));
+
+    // ── 4. Merge, sort, paginate ───────────────────────────────────────────
+    const all = [...dbItems, ...archiveItems].sort(
+      (a, b) => new Date(b.completionTime).getTime() - new Date(a.completionTime).getTime(),
+    );
+
+    const total = all.length;
+    const offset = (page - 1) * limit;
+    const pageData = all.slice(offset, offset + limit);
+
+    // ── 5. Summary over the full (unfiltered-by-page) result set ──────────
+    const summary: HistorySummaryDto = {
+      totalSplitsCreated: all.filter((i) => i.role === SplitRole.CREATOR).length,
+      totalSplitsParticipated: all.filter((i) => i.role === SplitRole.PARTICIPANT).length,
+      totalAmountPaid: all.filter((i) => i.finalAmount < 0).reduce((s, i) => s + Math.abs(i.finalAmount), 0),
+      totalAmountReceived: all.filter((i) => i.finalAmount > 0).reduce((s, i) => s + i.finalAmount, 0),
+      netAmount: all.reduce((s, i) => s + i.finalAmount, 0),
+    };
+
+    return {
+      data: pageData,
+      total,
+      page,
+      limit,
+      hasMore: offset + limit < total,
+      summary,
+      exportHint: {
+        endpoint: '/api/export',
+        supportedFormats: Object.values(ExportFormat),
+      },
+    };
+  }
 }

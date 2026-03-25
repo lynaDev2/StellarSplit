@@ -1,8 +1,12 @@
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
+import { BullModule } from "@nestjs/bull";
 import { PaymentsController } from "./payments.controller";
 import { PaymentsService } from "./payments.service";
 import { PaymentProcessorService } from "./payment-processor.service";
+import { PaymentReconciliationService } from "./payment-reconciliation.service";
+import { PaymentReconciliationProcessor } from "./payment-reconciliation.processor";
+import { PaymentSettlementProcessor } from "./payment-settlement.processor";
 import { StellarModule } from "../stellar/stellar.module";
 import { forwardRef } from "@nestjs/common";
 import { PaymentGateway } from "../websocket/payment.gateway";
@@ -20,6 +24,11 @@ import { IdempotencyInterceptor } from "../common/idempotency/idempotency.interc
 @Module({
   imports: [
     TypeOrmModule.forFeature([Payment, Participant, Split, IdempotencyRecord]),
+    // Register Bull queues for payment processing
+    BullModule.registerQueue(
+      { name: "payment-reconciliation" },
+      { name: "payment-settlement" },
+    ),
     forwardRef(() => StellarModule),
     EmailModule,
     MultiCurrencyModule,
@@ -30,11 +39,19 @@ import { IdempotencyInterceptor } from "../common/idempotency/idempotency.interc
   providers: [
     PaymentsService,
     PaymentProcessorService,
+    PaymentReconciliationService,
+    PaymentReconciliationProcessor,
+    PaymentSettlementProcessor,
     PaymentGateway,
     IdempotencyService,
     AnalyticsModule,
     IdempotencyInterceptor,
   ],
-  exports: [PaymentsService, PaymentProcessorService, IdempotencyService],
+  exports: [
+    PaymentsService,
+    PaymentProcessorService,
+    IdempotencyService,
+    PaymentReconciliationService,
+  ],
 })
 export class PaymentsModule {}

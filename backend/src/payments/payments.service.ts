@@ -24,12 +24,14 @@ export class PaymentsService {
   /**
    * Submit a payment with Stellar transaction hash
    */
-  async submitPayment(splitId: string, participantId: string, stellarTxHash: string) {
-    return await this.paymentProcessorService.processPaymentSubmission(
+  async submitPayment(splitId: string, participantId: string, stellarTxHash: string, idempotencyKey?: string, externalReference?: string) {
+    return await this.paymentProcessorService.processPaymentSubmission({
       splitId,
       participantId,
-      stellarTxHash,
-    );
+      txHash: stellarTxHash,
+      idempotencyKey,
+      externalReference,
+    });
   }
 
   /**
@@ -121,11 +123,11 @@ export class PaymentsService {
       return;
     }
 
-    const result = await this.paymentProcessorService.processPaymentSubmission(
+    const result = await this.paymentProcessorService.processPaymentSubmission({
       splitId,
       participantId,
       txHash,
-    );
+    });
 
     this.paymentGateway.emitPaymentStatusUpdate(splitId, {
       type: 'PAYMENT_CONFIRMED',

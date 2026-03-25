@@ -7,20 +7,67 @@ import {
   Optional,
 } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
-import { Repository } from "typeorm";
+import { Repository, DataSource } from "typeorm";
 import { StellarService } from "../stellar/stellar.service";
 import { PaymentGateway } from "../websocket/payment.gateway";
-import { Payment } from "../entities/payment.entity";
+import {
+  Payment,
+  PaymentProcessingStatus,
+  PaymentSettlementStatus,
+} from "../entities/payment.entity";
 import { Participant } from "../entities/participant.entity";
 import { Split } from "../entities/split.entity";
 import { EmailService } from "../email/email.service";
 import { MultiCurrencyService } from "../multi-currency/multi-currency.service";
 import { EventsGateway } from "../gateway/events.gateway";
 import { AnalyticsService } from "@/analytics/analytics.service";
+import * as crypto from "crypto";
+
+/**
+ * Result of processing a payment submission
+ */
+export interface PaymentSubmissionResult {
+  success: boolean;
+  message: string;
+  paymentId?: string;
+  isDuplicate?: boolean;
+  idempotencyKey?: string;
+}
+
+/**
+ * Options for processing a payment
+ */
+export interface ProcessPaymentOptions {
+  splitId: string;
+  participantId: string;
+  txHash: string;
+  idempotencyKey?: string;
+  externalReference?: string;
+  isRetry?: boolean;
+  maxRetries?: number;
+}
+
+/**
+ * Configuration for payment processing
+ */
+export interface PaymentProcessorConfig {
+  maxReconciliationAttempts: number;
+  reconciliationTimeoutMinutes: number;
+  stalePaymentThresholdMinutes: number;
+  enableIdempotencyChecks: boolean;
+}
+
+const DEFAULT_CONFIG: PaymentProcessorConfig = {
+  maxReconciliationAttempts: 5,
+  reconciliationTimeoutMinutes: 30,
+  stalePaymentThresholdMinutes: 60,
+  enableIdempotencyChecks: true,
+};
 
 @Injectable()
 export class PaymentProcessorService {
   private readonly logger = new Logger(PaymentProcessorService.name);
+  private readonly config: PaymentProcessorConfig;
 
   constructor(
     private readonly stellarService: StellarService,
@@ -32,63 +79,122 @@ export class PaymentProcessorService {
     @InjectRepository(Split) private splitRepository: Repository<Split>,
     private readonly emailService: EmailService,
     private readonly multiCurrencyService: MultiCurrencyService,
+    private readonly dataSource: DataSource,
     @Optional() private readonly analyticsService?: AnalyticsService,
-  ) {}
+    @Optional() private readonly customConfig?: Partial<PaymentProcessorConfig>,
+  ) {
+    this.config = { ...DEFAULT_CONFIG, ...customConfig };
+  }
+
   /**
-   * Process a payment submission
-   * @param splitId ID of the split
-   * @param participantId ID of the participant
-   * @param txHash Stellar transaction hash
+   * Generate an idempotency key for a payment
    */
-  async processPaymentSubmission(
+  generateIdempotencyKey(
     splitId: string,
     participantId: string,
     txHash: string,
-  ): Promise<{ success: boolean; message: string; paymentId?: string }> {
-    try {
-      this.logger.log(
-        `Processing payment submission for split ${splitId}, participant ${participantId}, tx ${txHash}`,
-      );
+  ): string {
+    const payload = `${splitId}:${participantId}:${txHash}`;
+    return crypto.createHash("sha256").update(payload).digest("hex");
+  }
 
-      // Check for duplicate submission
-      const existingPayment = await this.paymentRepository.findOne({
+  /**
+   * Process a payment submission with idempotency and transaction support
+   * @param options Payment processing options
+   */
+  async processPaymentSubmission(
+    options: ProcessPaymentOptions,
+  ): Promise<PaymentSubmissionResult> {
+    const { splitId, participantId, txHash, idempotencyKey, externalReference, isRetry } =
+      options;
+
+    this.logger.log(
+      `Processing payment submission for split ${splitId}, participant ${participantId}, tx ${txHash}`,
+    );
+
+    // Generate idempotency key if not provided
+    const key = idempotencyKey || this.generateIdempotencyKey(splitId, participantId, txHash);
+
+    // Start a database transaction for atomic operations
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      // Check for existing payment with idempotency key
+      const existingByKey = await queryRunner.manager.findOne(Payment, {
+        where: { idempotencyKey: key },
+      });
+
+      if (existingByKey) {
+        this.logger.warn(`Duplicate payment detected via idempotency key: ${key}`);
+        await queryRunner.rollbackTransaction();
+        return {
+          success: true,
+          message: "Payment already processed",
+          paymentId: existingByKey.id,
+          isDuplicate: true,
+          idempotencyKey: key,
+        };
+      }
+
+      // Check for duplicate txHash (legacy check)
+      const existingByTxHash = await queryRunner.manager.findOne(Payment, {
         where: { txHash },
       });
 
-      if (existingPayment) {
-        throw new ConflictException(
-          "Payment with this transaction hash already exists",
-        );
+      if (existingByTxHash) {
+        this.logger.warn(`Duplicate payment detected via txHash: ${txHash}`);
+        await queryRunner.rollbackTransaction();
+        return {
+          success: true,
+          message: "Payment with this transaction hash already exists",
+          paymentId: existingByTxHash.id,
+          isDuplicate: true,
+          idempotencyKey: key,
+        };
       }
 
       // Verify the transaction on Stellar network
-      const verificationResult =
-        await this.stellarService.verifyTransaction(txHash);
+      const verificationResult = await this.stellarService.verifyTransaction(txHash);
 
       if (!verificationResult || !verificationResult.valid) {
+        await queryRunner.rollbackTransaction();
         throw new BadRequestException(
           "Invalid or unsuccessful Stellar transaction",
         );
       }
 
-      // Get the participant record
-      const participant = await this.participantRepository.findOne({
+      // Get the participant record with lock
+      const participant = await queryRunner.manager.findOne(Participant, {
         where: { id: participantId, splitId },
+        lock: { mode: "pessimistic_write" },
       });
 
       if (!participant) {
+        await queryRunner.rollbackTransaction();
         throw new NotFoundException(
           `Participant ${participantId} not found for split ${splitId}`,
         );
       }
 
       // Get split to check preferred currency
-      const split = await this.splitRepository.findOne({
+      const split = await queryRunner.manager.findOne(Split, {
         where: { id: splitId },
+        lock: { mode: "pessimistic_write" },
       });
 
       if (!split) {
+        await queryRunner.rollbackTransaction();
         throw new NotFoundException(`Split ${splitId} not found`);
+      }
+
+      // Check if split is frozen
+      if (split.isFrozen) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException(
+          "Split is frozen due to an active dispute",
+        );
       }
 
       // Determine the paid asset (from path payment source or regular payment)
@@ -118,7 +224,7 @@ export class PaymentProcessorService {
               paidAsset,
               paidAmount,
               receivedAsset: (split as any).preferredCurrency || receivedAsset,
-              slippageTolerance: 0.01, // 1% slippage tolerance
+              slippageTolerance: 0.01,
             });
 
           receivedAmount = multiCurrencyResult.receivedAmount;
@@ -127,275 +233,224 @@ export class PaymentProcessorService {
           this.logger.warn(
             `Multi-currency processing failed, using direct payment: ${error.message}`,
           );
-          // Fall back to direct payment processing
         }
       }
 
-      // Validate that payment matches participant's owed amount (use received amount after conversion)
+      // Determine payment status based on amount
+      let paymentStatus: PaymentProcessingStatus;
+      let settlementStatus: PaymentSettlementStatus;
+
       if (receivedAmount < participant.amountOwed) {
-        // Handle partial payment
-        await this.handlePartialPayment(
-          splitId,
-          participantId,
-          participant,
-          {
-            ...verificationResult,
-            amount: receivedAmount,
-            asset: receivedAsset,
-          },
-          txHash,
-        );
-
-        const paymentId = await this.createPaymentRecord(
-          splitId,
-          participantId,
-          {
-            ...verificationResult,
-            amount: receivedAmount,
-            asset: receivedAsset,
-          },
-          txHash,
-          "partial",
-        );
-
-        return {
-          success: true,
-          message: `Partial payment received. Amount: ${paidAmount} ${paidAsset}${multiCurrencyResult?.requiresConversion ? ` (converted to ${receivedAmount} ${receivedAsset})` : ""}. Expected: ${participant.amountOwed}`,
-          paymentId,
-        };
+        paymentStatus = PaymentProcessingStatus.PARTIAL;
+        settlementStatus = PaymentSettlementStatus.CONFIRMED;
       } else if (receivedAmount > participant.amountOwed) {
-        // Overpayment scenario - still mark as paid but note the overpayment
-        await this.handleCompletePayment(
-          splitId,
-          participantId,
-          participant,
-          {
-            ...verificationResult,
-            amount: receivedAmount,
-            asset: receivedAsset,
-          },
-          txHash,
-        );
-
-        const paymentId = await this.createPaymentRecord(
-          splitId,
-          participantId,
-          {
-            ...verificationResult,
-            amount: receivedAmount,
-            asset: receivedAsset,
-          },
-          txHash,
-          "confirmed",
-        );
-
-        return {
-          success: true,
-          message: `Payment received with overpayment. Amount: ${paidAmount} ${paidAsset}${multiCurrencyResult?.requiresConversion ? ` (converted to ${receivedAmount} ${receivedAsset})` : ""}. Expected: ${participant.amountOwed}`,
-          paymentId,
-        };
+        paymentStatus = PaymentProcessingStatus.CONFIRMED;
+        settlementStatus = PaymentSettlementStatus.CONFIRMED;
       } else {
-        // Exact payment
-        await this.handleCompletePayment(
-          splitId,
-          participantId,
-          participant,
-          {
-            ...verificationResult,
-            amount: receivedAmount,
-            asset: receivedAsset,
-          },
-          txHash,
-        );
-
-        const paymentId = await this.createPaymentRecord(
-          splitId,
-          participantId,
-          {
-            ...verificationResult,
-            amount: receivedAmount,
-            asset: receivedAsset,
-          },
-          txHash,
-          "confirmed",
-        );
-
-        return {
-          success: true,
-          message: `Payment confirmed. Amount: ${paidAmount} ${paidAsset}${multiCurrencyResult?.requiresConversion ? ` (converted to ${receivedAmount} ${receivedAsset})` : ""}`,
-          paymentId,
-        };
+        paymentStatus = PaymentProcessingStatus.CONFIRMED;
+        settlementStatus = PaymentSettlementStatus.CONFIRMED;
       }
+
+      // Create payment record with idempotency key
+      const payment = queryRunner.manager.create(Payment, {
+        idempotencyKey: key,
+        splitId,
+        participantId,
+        txHash,
+        amount: receivedAmount,
+        asset: receivedAsset,
+        status: paymentStatus,
+        settlementStatus,
+        lastSettlementCheck: new Date(),
+        reconciliationAttempts: 0,
+        maxReconciliationAttempts: this.config.maxReconciliationAttempts,
+        notificationsSent: false,
+        processedAt: new Date(),
+        externalReference,
+      });
+
+      const savedPayment = await queryRunner.manager.save(Payment, payment);
+
+      // Update participant's paid amount and status
+      const newAmountPaid = participant.amountPaid + receivedAmount;
+      let participantStatus: "pending" | "paid" | "partial" = "partial";
+
+      if (newAmountPaid >= participant.amountOwed) {
+        participantStatus = "paid";
+      } else if (newAmountPaid === 0) {
+        participantStatus = "pending";
+      }
+
+      await queryRunner.manager.update(Participant, { id: participantId }, {
+        amountPaid: newAmountPaid,
+        status: participantStatus,
+      });
+
+      // Update split's total paid amount
+      await this.updateSplitAmountPaidTransactional(queryRunner, splitId);
+
+      // Commit the transaction
+      await queryRunner.commitTransaction();
+
+      // Send notifications (outside transaction)
+      await this.sendPaymentNotifications(
+        participantId,
+        splitId,
+        paymentStatus,
+        {
+          txHash,
+          amount: receivedAmount,
+          asset: receivedAsset,
+        },
+      );
+
+      // Invalidate analytics cache
+      await this.invalidateAnalyticsCache(participant.userId);
+
+      const statusMessage =
+        paymentStatus === PaymentProcessingStatus.PARTIAL
+          ? `Partial payment received. Amount: ${paidAmount} ${paidAsset}${multiCurrencyResult?.requiresConversion ? ` (converted to ${receivedAmount} ${receivedAsset})` : ""}. Expected: ${participant.amountOwed}`
+          : paymentStatus === PaymentProcessingStatus.CONFIRMED && receivedAmount > participant.amountOwed
+          ? `Payment received with overpayment. Amount: ${paidAmount} ${paidAsset}${multiCurrencyResult?.requiresConversion ? ` (converted to ${receivedAmount} ${receivedAsset})` : ""}. Expected: ${participant.amountOwed}`
+          : `Payment confirmed. Amount: ${paidAmount} ${paidAsset}${multiCurrencyResult?.requiresConversion ? ` (converted to ${receivedAmount} ${receivedAsset})` : ""}`;
+
+      return {
+        success: true,
+        message: statusMessage,
+        paymentId: savedPayment.id,
+        idempotencyKey: key,
+      };
     } catch (error: any) {
+      await queryRunner.rollbackTransaction();
       this.logger.error(
         `Error processing payment submission: ${error.message}`,
         error.stack,
       );
       throw error;
+    } finally {
+      await queryRunner.release();
     }
   }
 
   /**
-   * Handle partial payment scenario
+   * Handle webhook replay of payment events
+   * This ensures idempotent processing of webhook events
    */
-  private async handlePartialPayment(
-    splitId: string,
-    participantId: string,
-    participant: Participant,
-    verificationResult: any,
+  async handleWebhookReplay(
     txHash: string,
-  ): Promise<void> {
-    // Update participant's paid amount and status
-    await this.participantRepository.update(
-      { id: participantId },
-      {
-        amountPaid: verificationResult.amount,
-        status: "partial",
-      },
-    );
+    externalReference: string,
+  ): Promise<PaymentSubmissionResult> {
+    this.logger.log(`Handling webhook replay for tx: ${txHash}, ref: ${externalReference}`);
 
-    // Update split's total paid amount
-    await this.updateSplitAmountPaid(splitId);
-
-    // Send notification
-    this.sendPaymentNotification(
-      participantId,
-      "partial_payment_received",
-      {
-        txHash,
-        amount: verificationResult.amount,
-        expected: participant.amountOwed,
-      },
-      splitId,
-    );
-
-    // Invalidate analytics cache for this user and optionally refresh materialized views
-    try {
-      if (this.analyticsService) {
-        await this.analyticsService.invalidateUserCache(participant.userId);
-        // best-effort async refresh
-        this.analyticsService.refreshMaterializedViewsNow();
-      }
-    } catch (err) {
-      this.logger.warn(
-        "Failed to notify analytics service about partial payment",
-        err,
-      );
-    }
-  }
-
-  /**
-   * Handle complete payment scenario
-   */
-  private async handleCompletePayment(
-    splitId: string,
-    participantId: string,
-    participant: Participant,
-    verificationResult: any,
-    txHash: string,
-  ): Promise<void> {
-    // Update participant's status to paid
-    await this.participantRepository.update(
-      { id: participantId },
-      {
-        amountPaid: participant.amountOwed,
-        status: "paid",
-      },
-    );
-
-    // Update split's total paid amount
-    await this.updateSplitAmountPaid(splitId);
-
-    // Send notification
-    this.sendPaymentNotification(
-      participantId,
-      "payment_confirmed",
-      {
-        txHash,
-        amount: verificationResult.amount,
-      },
-      splitId,
-    );
-
-    // Trigger Email Notification
-    this.triggerPaymentConfirmationEmail(participantId, {
-      amount: verificationResult.amount,
-      splitId,
-      txHash,
+    // Check if we already processed this
+    const existingPayment = await this.paymentRepository.findOne({
+      where: { txHash },
     });
 
-    // Invalidate analytics cache for this user and optionally refresh materialized views
-    try {
-      if (this.analyticsService) {
-        await this.analyticsService.invalidateUserCache(participant.userId);
-        // best-effort async refresh
-        this.analyticsService.refreshMaterializedViewsNow();
+    if (existingPayment) {
+      // If already processed and notifications sent, return success
+      if (existingPayment.notificationsSent) {
+        return {
+          success: true,
+          message: "Payment already processed and notifications sent",
+          paymentId: existingPayment.id,
+          isDuplicate: true,
+        };
       }
-    } catch (err) {
-      this.logger.warn(
-        "Failed to notify analytics service about payment confirmation",
-        err,
+
+      // If not notifications sent, resend them
+      if (!existingPayment.notificationsSent) {
+        await this.resendNotifications(existingPayment);
+        return {
+          success: true,
+          message: "Notifications resent for existing payment",
+          paymentId: existingPayment.id,
+        };
+      }
+    }
+
+    // For webhook replays without existing payment, we need to find the split/participant
+    // This requires additional context - return error with guidance
+    throw new BadRequestException(
+      "Cannot process webhook replay without existing payment record. Provide idempotency key for original submission.",
+    );
+  }
+
+  /**
+   * Retry a failed payment
+   */
+  async retryPayment(
+    paymentId: string,
+    newTxHash: string,
+  ): Promise<PaymentSubmissionResult> {
+    const payment = await this.paymentRepository.findOne({
+      where: { id: paymentId },
+      relations: ["participant", "participant.split"],
+    });
+
+    if (!payment) {
+      throw new NotFoundException(`Payment ${paymentId} not found`);
+    }
+
+    if (payment.status !== PaymentProcessingStatus.FAILED) {
+      throw new ConflictException(
+        "Only failed payments can be retried",
       );
     }
+
+    // Generate new idempotency key for the retry
+    const newIdempotencyKey = this.generateIdempotencyKey(
+      payment.splitId,
+      payment.participantId,
+      newTxHash,
+    );
+
+    return this.processPaymentSubmission({
+      splitId: payment.splitId,
+      participantId: payment.participantId,
+      txHash: newTxHash,
+      idempotencyKey: newIdempotencyKey,
+      isRetry: true,
+    });
   }
 
   /**
-   * Create a payment record in the database
+   * Update split amount paid within a transaction
    */
-  private async createPaymentRecord(
+  private async updateSplitAmountPaidTransactional(
+    queryRunner: any,
     splitId: string,
-    participantId: string,
-    verificationResult: any,
-    txHash: string,
-    status: "pending" | "confirmed" | "failed" | "partial",
-  ): Promise<string> {
-    const payment: Payment = {
-      id: this.generateId(),
-      splitId,
-      participantId,
-      txHash,
-      amount: verificationResult.amount,
-      asset: verificationResult.asset,
-      status,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const savedPayment = await this.paymentRepository.save(payment);
-    return savedPayment.id;
-  }
-
-  /**
-   * Update the total amount paid for a split
-   */
-  private async updateSplitAmountPaid(splitId: string): Promise<void> {
+  ): Promise<void> {
     // Calculate total amount paid by summing all participants' paid amounts
-    const participants = await this.participantRepository.find({
+    const participants = await queryRunner.manager.find(Participant, {
       where: { splitId },
     });
 
     const totalPaid = participants.reduce(
-      (sum, participant) => sum + participant.amountPaid,
+      (sum: number, participant: Participant) =>
+        sum + Number(participant.amountPaid || 0),
       0,
     );
 
     // Get the split to update
-    const split = await this.splitRepository.findOne({
+    const split = await queryRunner.manager.findOne(Split, {
       where: { id: splitId },
     });
+
     if (!split) {
       throw new NotFoundException(`Split ${splitId} not found`);
     }
 
     // Determine split status based on total paid vs total amount
     let status: "active" | "completed" | "partial" = "active";
-    if (totalPaid >= split.totalAmount) {
+    if (Number(totalPaid) >= Number(split.totalAmount)) {
       status = "completed";
-    } else if (totalPaid > 0) {
+    } else if (Number(totalPaid) > 0) {
       status = "partial";
     }
 
-    await this.splitRepository.update(
+    await queryRunner.manager.update(
+      Split,
       { id: splitId },
       {
         amountPaid: totalPaid,
@@ -403,8 +458,13 @@ export class PaymentProcessorService {
       },
     );
 
-    // Send notification if split is now completed
-    this.sendSplitUpdateNotification(splitId, status, totalPaid);
+    // Send split update notification
+    this.eventsGateway.emitSplitUpdated(splitId, {
+      splitId,
+      status,
+      amountPaid: totalPaid,
+      timestamp: new Date().toISOString(),
+    });
 
     if (status === "completed") {
       this.sendSplitCompletedNotification(splitId);
@@ -412,39 +472,83 @@ export class PaymentProcessorService {
   }
 
   /**
-   * Send payment notification via WebSocket
+   * Send payment notifications
    */
-  private sendPaymentNotification(
+  private async sendPaymentNotifications(
     participantId: string,
-    type: string,
-    data: any,
     splitId: string,
-  ): void {
+    status: PaymentProcessingStatus,
+    data: { txHash: string; amount: number; asset: string },
+  ): Promise<void> {
+    const notificationType =
+      status === PaymentProcessingStatus.PARTIAL
+        ? "partial_payment_received"
+        : "payment_confirmed";
+
     // Emit to WebSocket gateway
     const roomId = `participant_${participantId}`;
     this.paymentGateway.emitPaymentNotification(roomId, {
-      type,
+      type: notificationType,
       data,
       timestamp: new Date(),
     });
     this.eventsGateway.emitPaymentReceived(splitId, {
       participantId,
-      type,
+      type: notificationType,
       ...data,
       timestamp: new Date().toISOString(),
     });
 
     this.logger.log(
-      `Sending payment notification for participant ${participantId}: ${type}`,
-      data,
+      `Sending payment notification for participant ${participantId}: ${notificationType}`,
     );
+
+    // Trigger Email Notification
+    await this.triggerPaymentConfirmationEmail(participantId, {
+      amount: data.amount,
+      splitId,
+      txHash: data.txHash,
+    });
+  }
+
+  /**
+   * Resend notifications for an existing payment
+   */
+  private async resendNotifications(payment: Payment): Promise<void> {
+    const notificationType =
+      payment.status === PaymentProcessingStatus.PARTIAL
+        ? "partial_payment_received"
+        : "payment_confirmed";
+
+    this.paymentGateway.emitPaymentNotification(`participant_${payment.participantId}`, {
+      type: notificationType,
+      data: {
+        txHash: payment.txHash,
+        amount: payment.amount,
+        asset: payment.asset,
+      },
+      timestamp: new Date(),
+    });
+
+    this.eventsGateway.emitPaymentReceived(payment.splitId, {
+      participantId: payment.participantId,
+      type: notificationType,
+      txHash: payment.txHash,
+      amount: payment.amount,
+      asset: payment.asset,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Update notification sent flag
+    await this.paymentRepository.update(payment.id, {
+      notificationsSent: true,
+    });
   }
 
   /**
    * Send split completion notification
    */
   private sendSplitCompletedNotification(splitId: string): void {
-    // Emit to WebSocket gateway
     const roomId = `split_${splitId}`;
     this.paymentGateway.emitSplitCompletion(roomId, {
       splitId,
@@ -457,25 +561,9 @@ export class PaymentProcessorService {
       timestamp: new Date().toISOString(),
     });
 
-    this.logger.log(
-      `Sending split completed notification for split ${splitId}`,
-    );
+    this.logger.log(`Sending split completed notification for split ${splitId}`);
 
-    // Trigger Email Notification for all participants
     this.triggerSplitCompletedEmail(splitId);
-  }
-
-  private sendSplitUpdateNotification(
-    splitId: string,
-    status: "active" | "completed" | "partial",
-    amountPaid: number,
-  ): void {
-    this.eventsGateway.emitSplitUpdated(splitId, {
-      splitId,
-      status,
-      amountPaid,
-      timestamp: new Date().toISOString(),
-    });
   }
 
   /**
@@ -499,55 +587,45 @@ export class PaymentProcessorService {
         if (user) {
           await this.emailService.sendPaymentConfirmation(user.email, {
             amount: data.amount,
-            splitDescription: split?.description || "Split payment",
+            splitDescription: split?.description || "Payment",
             txHash: data.txHash,
           });
         }
       }
-    } catch (error: any) {
-      this.logger.error(
-        `Failed to trigger payment confirmation email: ${error.message}`,
-      );
+    } catch (error) {
+      this.logger.warn(`Failed to send payment confirmation email: ${error}`);
     }
   }
 
   /**
    * Trigger split completed email
    */
-  private async triggerSplitCompletedEmail(splitId: string) {
-    try {
-      const split = await this.splitRepository.findOne({
-        where: { id: splitId },
-      });
-      const participants = await this.participantRepository.find({
-        where: { splitId },
-      });
+  private triggerSplitCompletedEmail(splitId: string): void {
+    // Implementation would send emails to all participants
+    this.logger.log(`Triggering split completed email for split ${splitId}`);
+  }
 
-      if (split) {
-        for (const participant of participants) {
-          const user = await this.emailService.getUser(participant.userId);
-          if (user) {
-            await this.emailService.sendSplitCompleted(user.email, {
-              splitDescription: split.description || "Split payment",
-              totalAmount: split.totalAmount,
-            });
-          }
-        }
+  /**
+   * Invalidate analytics cache
+   */
+  private async invalidateAnalyticsCache(userId: string): Promise<void> {
+    try {
+      if (this.analyticsService) {
+        await this.analyticsService.invalidateUserCache(userId);
+        this.analyticsService.refreshMaterializedViewsNow();
       }
-    } catch (error: any) {
-      this.logger.error(
-        `Failed to trigger split completed email: ${error.message}`,
+    } catch (err) {
+      this.logger.warn(
+        "Failed to notify analytics service about payment",
+        err,
       );
     }
   }
 
   /**
-   * Generate a simple ID for entities
+   * Generate a unique ID
    */
   private generateId(): string {
-    return (
-      Math.random().toString(36).substring(2, 15) +
-      Math.random().toString(36).substring(2, 15)
-    );
+    return crypto.randomUUID();
   }
 }

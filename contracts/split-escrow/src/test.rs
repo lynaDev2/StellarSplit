@@ -2,7 +2,17 @@
 
 use crate::{SplitEscrowContract, SplitEscrowContractClient, SplitStatus};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient as TokenAdminClient};
-use soroban_sdk::{testutils::Address as _, testutils::Events as _, Address, Env, String};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events as _, Address, Env, Map, String,
+};
+
+fn metadata_map(env: &Env, entries: &[(&str, &str)]) -> Map<String, String> {
+    let mut metadata = Map::new(env);
+    for (key, value) in entries {
+        metadata.set(String::from_str(env, key), String::from_str(env, value));
+    }
+    metadata
+}
 
 fn setup() -> (
     Env,
@@ -29,7 +39,7 @@ fn setup() -> (
 
     let contract_id = env.register_contract(None, SplitEscrowContract);
     let client = SplitEscrowContractClient::new(&env, &contract_id);
-    client.initialize(&admin, &token);
+    client.initialize(&admin, &token, &String::from_str(&env, "1.0.0"));
 
     token_admin_client.mint(&participant, &1_000_000);
 
@@ -127,6 +137,74 @@ fn test_fees_collected_event_emitted() {
 
     let after_len = env.events().all().len();
     assert!(after_len > before_len);
+}
+
+#[test]
+fn test_version_stored_on_init() {
+    let (env, client, _, _, _, _, _) = setup();
+    assert_eq!(client.get_version(), String::from_str(&env, "1.0.0"));
+}
+
+#[test]
+fn test_upgrade_version_admin() {
+    let (env, client, admin, _, _, _, _) = setup();
+
+    client.upgrade_version(&String::from_str(&env, "1.1.0"));
+    assert_eq!(client.get_version(), String::from_str(&env, "1.1.0"));
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #3)")] // Unauthorized
+fn test_upgrade_version_non_admin_fails() {
+    let (env, client, _, creator, _, _, _) = setup();
+
+    env.mock_all_auths_providing_64bit_allowance(); // Reset mocks to require specific auth
+
+    // Switch to creator auth
+    client.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &creator,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            function: "upgrade_version",
+            args: (String::from_str(&env, "1.1.0"),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client.upgrade_version(&String::from_str(&env, "1.1.0"));
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #11)")] // InvalidVersion
+fn test_upgrade_version_invalid_semver_fails() {
+    let (env, client, _, _, _, _, _) = setup();
+    client.upgrade_version(&String::from_str(&env, "1.0"));
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #11)")] // InvalidVersion
+fn test_initialize_invalid_version_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register_contract(None, SplitEscrowContract);
+    let client = SplitEscrowContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &token, &String::from_str(&env, "1.0"));
+}
+
+#[test]
+fn test_contract_upgraded_event_emitted() {
+    let (env, client, _, _, _, _, _) = setup();
+
+    let before_len = env.events().all().len();
+    client.upgrade_version(&String::from_str(&env, "2.0.0"));
+    let after_len = env.events().all().len();
+
+    assert!(after_len > before_len);
+
+    let last_event = env.events().all().last().unwrap();
+    assert_eq!(last_event.0, client.address);
 }
 
 #[test]

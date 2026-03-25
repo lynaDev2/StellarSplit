@@ -10,6 +10,7 @@ import * as path from 'path';
 
 import databaseConfig from './config/database.config';
 import appConfig from './config/app.config';
+import { getRedisConnectionOptions } from './config/redis.config';
 
 import { HealthModule } from './modules/health/health.module';
 import { StellarModule } from './stellar/stellar.module';
@@ -42,6 +43,9 @@ import { UploadModule } from "./uploads/upload.module";
 import { ProfileModule } from "./profile/profile.module";
 import { InvitationsModule } from "./invitations/invitations.module";
 import { CommonModule } from "./common/common.module";
+import { DebtSimplificationModule } from "./debt-simplification/debt-simplification.module";
+import { OcrModule } from "./ocr/ocr.module";
+import { DashboardModule } from "./dashboard/dashboard.module";
 // Load environment variables
 dotenv.config({
   path: path.resolve(__dirname, '../.env'),
@@ -82,10 +86,7 @@ dotenv.config({
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
-        redis: {
-          host: configService.get("REDIS_HOST", "localhost"),
-          port: configService.get("REDIS_PORT", 6379),
-        },
+        redis: getRedisConnectionOptions(configService),
       }),
     }),
 
@@ -125,7 +126,10 @@ dotenv.config({
     UploadModule,
     ProfileModule,
     InvitationsModule,
+    OcrModule,
     CommonModule,
+    DebtSimplificationModule,
+    DashboardModule,
   ],
 })
 export class AppModule { }

@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Map, String, Vec};
 
 mod errors;
 mod events;
@@ -33,20 +33,68 @@ fn participant_known(participants: &Vec<Address>, addr: &Address) -> bool {
     false
 }
 
+fn validate_metadata(metadata: &Map<String, String>) -> Result<(), Error> {
+    if metadata.len() > MAX_METADATA_ENTRIES {
+        return Err(Error::InvalidMetadata);
+    }
+
+    let keys = metadata.keys();
+    let mut i = 0u32;
+    while i < keys.len() {
+        let key = keys.get(i).unwrap();
+        let value = metadata.get(key.clone()).unwrap();
+        if key.len() > MAX_METADATA_STRING_LEN || value.len() > MAX_METADATA_STRING_LEN {
+            return Err(Error::InvalidMetadata);
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
+fn is_active(status: &SplitStatus) -> bool {
+    *status != SplitStatus::Released
+}
+
 #[contract]
 pub struct SplitEscrowContract;
 
 #[contractimpl]
 impl SplitEscrowContract {
-    pub fn initialize(env: Env, admin: Address, token_address: Address) -> Result<(), Error> {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        token_address: Address,
+        version: String,
+    ) -> Result<(), Error> {
         if storage::has_admin(&env) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
+
+        validate_version(&version)?;
+
         storage::set_admin(&env, &admin);
         storage::set_token(&env, &token_address);
         storage::set_fee_bps(&env, 0u32);
+        storage::set_version(&env, &version);
         events::emit_initialized(&env, &admin);
+        Ok(())
+    }
+
+    pub fn get_version(env: Env) -> String {
+        storage::get_version(&env)
+    }
+
+    pub fn upgrade_version(env: Env, new_version: String) -> Result<(), Error> {
+        let admin = storage::get_admin(&env);
+        admin.require_auth();
+
+        validate_version(&new_version)?;
+
+        let old_version = storage::get_version(&env);
+        storage::set_version(&env, &new_version);
+        events::emit_contract_upgraded(&env, old_version, new_version);
         Ok(())
     }
 
@@ -88,6 +136,7 @@ impl SplitEscrowContract {
             split_id,
             creator,
             description,
+            metadata,
             total_amount,
             deposited_amount: 0,
             status: SplitStatus::Pending,
@@ -96,6 +145,7 @@ impl SplitEscrowContract {
             note: note_stored,
         };
         storage::set_split(&env, &split);
+        storage::set_whitelist_enabled(&env, split_id, whitelist_enabled);
         events::emit_split_created(&env, &split);
         Ok(split_id)
     }
@@ -138,6 +188,11 @@ impl SplitEscrowContract {
         if split.status != SplitStatus::Pending {
             return Err(Error::SplitNotPending);
         }
+        if storage::is_whitelist_enabled(&env, split_id)
+            && !storage::is_whitelisted(&env, split_id, &participant)
+        {
+            return Err(Error::Unauthorized);
+        }
         if split.deposited_amount + amount > split.total_amount {
             return Err(Error::InvalidAmount);
         }
@@ -159,6 +214,20 @@ impl SplitEscrowContract {
         }
         storage::set_split(&env, &split);
         events::emit_deposit(&env, split_id, &participant, amount);
+        Ok(())
+    }
+
+    pub fn add_to_whitelist(env: Env, split_id: u64, address: Address) -> Result<(), Error> {
+        let split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        split.creator.require_auth();
+        storage::add_to_whitelist(&env, split_id, &address);
+        Ok(())
+    }
+
+    pub fn remove_from_whitelist(env: Env, split_id: u64, address: Address) -> Result<(), Error> {
+        let split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        split.creator.require_auth();
+        storage::remove_from_whitelist(&env, split_id, &address);
         Ok(())
     }
 
@@ -199,4 +268,61 @@ impl SplitEscrowContract {
     pub fn get_escrow(env: Env, split_id: u64) -> Result<Split, Error> {
         storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)
     }
+
+    pub fn get_metadata(env: Env, split_id: u64) -> Result<Map<String, String>, Error> {
+        let split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        Ok(split.metadata)
+    }
+
+    pub fn update_metadata(
+        env: Env,
+        split_id: u64,
+        metadata: Map<String, String>,
+    ) -> Result<(), Error> {
+        validate_metadata(&metadata)?;
+
+        let mut split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        split.creator.require_auth();
+        if !is_active(&split.status) {
+            return Err(Error::SplitNotActive);
+        }
+
+        split.metadata = metadata;
+        storage::set_split(&env, &split);
+        Ok(())
+    }
+}
+
+fn validate_version(version: &String) -> Result<(), Error> {
+    let len = version.len() as usize;
+    if len == 0 || len > 32 {
+        return Err(Error::InvalidVersion);
+    }
+
+    let mut buf = [0u8; 32];
+    version.copy_into_slice(&mut buf[..len]);
+
+    let mut dot_count = 0;
+    let mut part_len = 0;
+
+    for i in 0..len {
+        let b = buf[i];
+        if b == b'.' {
+            if part_len == 0 {
+                return Err(Error::InvalidVersion);
+            }
+            dot_count += 1;
+            part_len = 0;
+        } else if b >= b'0' && b <= b'9' {
+            part_len += 1;
+        } else {
+            return Err(Error::InvalidVersion);
+        }
+    }
+
+    if dot_count != 2 || part_len == 0 {
+        return Err(Error::InvalidVersion);
+    }
+
+    Ok(())
 }

@@ -3,12 +3,13 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Invitation } from './invitation.entity';
 import { Participant } from '../entities/participant.entity';
 import { Split } from '../entities/split.entity';
+import { User } from '../entities/user.entity';
 import { InvitationsService } from './invitations.service';
 import { InvitationsController } from './invitations.controller';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Invitation, Participant, Split]),
+    TypeOrmModule.forFeature([Invitation, Participant, Split, User]),
   ],
   controllers: [InvitationsController],
   providers: [InvitationsService],

@@ -12,6 +12,7 @@ import { User } from "../entities/user.entity";
 import { AnalyticsReport } from "./reports.entity";
 import { AnalyticsController } from "./analytics.controller";
 import { AnalyticsProcessor } from "./analytics.processor";
+import { getRedisConnectionOptions } from "../config/redis.config";
 
 @Module({
   imports: [
@@ -23,8 +24,7 @@ import { AnalyticsProcessor } from "./analytics.processor";
         ttl: configService.get<number>("ANALYTICS_CACHE_TTL", 300),
         isGlobal: false,
         store: require("cache-manager-redis-store"),
-        host: configService.get("REDIS_HOST", "localhost"),
-        port: configService.get("REDIS_PORT", 6379),
+        ...getRedisConnectionOptions(configService),
       }),
     }),
     BullModule.registerQueue({ name: "analytics-export" }),

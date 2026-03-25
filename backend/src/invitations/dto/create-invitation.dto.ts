@@ -1,4 +1,4 @@
-import { IsUUID, IsOptional, IsInt, Min, Max } from 'class-validator';
+import { IsUUID, IsOptional, IsInt, Min, Max, IsEmail, IsBoolean } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 
@@ -21,4 +21,34 @@ export class CreateInvitationDto {
   @Max(720)
   @Type(() => Number)
   expiresInHours?: number = DEFAULT_EXPIRY_HOURS;
+
+  @ApiPropertyOptional({
+    description: 'Maximum number of times this invitation can be used (default 1)',
+    default: 1,
+    minimum: 1,
+    maximum: 100,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @Type(() => Number)
+  maxUses?: number = 1;
+
+  @ApiPropertyOptional({
+    description: 'Email of the invitee (for duplicate detection)',
+    example: 'alice@example.com',
+  })
+  @IsOptional()
+  @IsEmail()
+  inviteeEmail?: string;
+
+  @ApiPropertyOptional({
+    description: 'Whether this invitation can be upgraded to a registered user (default true)',
+    default: true,
+  })
+  @IsOptional()
+  @IsBoolean()
+  @Type(() => Boolean)
+  isUpgradeable?: boolean = true;
 }
