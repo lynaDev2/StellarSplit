@@ -9,6 +9,8 @@ pub enum DataKey {
     Token,
     NextSplitId,
     Split(u64),
+    WhitelistEnabled(u64),
+    WhitelistMember(u64, Address),
     FeeBps,
     Treasury,
     Version,
@@ -57,13 +59,47 @@ pub fn bump_next_split_id(env: &Env) {
 }
 
 pub fn set_split(env: &Env, split: &Split) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::Split(split.split_id), split);
+    let key = DataKey::Split(split.split_id);
+    let max_ttl = env.ledger().max_ttl();
+    env.storage().persistent().set(&key, split);
+    env.storage().persistent().extend_ttl(&key, max_ttl, max_ttl);
 }
 
 pub fn get_split(env: &Env, split_id: u64) -> Option<Split> {
     env.storage().persistent().get(&DataKey::Split(split_id))
+}
+
+pub fn set_whitelist_enabled(env: &Env, split_id: u64, enabled: bool) {
+    let key = DataKey::WhitelistEnabled(split_id);
+    let max_ttl = env.ledger().max_ttl();
+    env.storage().persistent().set(&key, &enabled);
+    env.storage().persistent().extend_ttl(&key, max_ttl, max_ttl);
+}
+
+pub fn is_whitelist_enabled(env: &Env, split_id: u64) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::WhitelistEnabled(split_id))
+        .unwrap_or(false)
+}
+
+pub fn add_to_whitelist(env: &Env, split_id: u64, address: &Address) {
+    let key = DataKey::WhitelistMember(split_id, address.clone());
+    let max_ttl = env.ledger().max_ttl();
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(&key, max_ttl, max_ttl);
+}
+
+pub fn remove_from_whitelist(env: &Env, split_id: u64, address: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::WhitelistMember(split_id, address.clone()));
+}
+
+pub fn is_whitelisted(env: &Env, split_id: u64, address: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::WhitelistMember(split_id, address.clone()))
 }
 
 pub fn set_fee_bps(env: &Env, fee_bps: u32) {

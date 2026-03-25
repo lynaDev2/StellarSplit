@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Map, String, Vec};
 
 mod errors;
 mod events;
@@ -13,6 +13,8 @@ pub use crate::errors::Error;
 pub use crate::types::{Split, SplitStatus};
 
 const DEFAULT_MAX_PARTICIPANTS: u32 = 50;
+const MAX_METADATA_ENTRIES: u32 = 5;
+const MAX_METADATA_STRING_LEN: u32 = 64;
 
 fn participant_known(participants: &Vec<Address>, addr: &Address) -> bool {
     let mut i = 0u32;
@@ -23,6 +25,29 @@ fn participant_known(participants: &Vec<Address>, addr: &Address) -> bool {
         i += 1;
     }
     false
+}
+
+fn validate_metadata(metadata: &Map<String, String>) -> Result<(), Error> {
+    if metadata.len() > MAX_METADATA_ENTRIES {
+        return Err(Error::InvalidMetadata);
+    }
+
+    let keys = metadata.keys();
+    let mut i = 0u32;
+    while i < keys.len() {
+        let key = keys.get(i).unwrap();
+        let value = metadata.get(key.clone()).unwrap();
+        if key.len() > MAX_METADATA_STRING_LEN || value.len() > MAX_METADATA_STRING_LEN {
+            return Err(Error::InvalidMetadata);
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
+fn is_active(status: &SplitStatus) -> bool {
+    *status != SplitStatus::Released
 }
 
 #[contract]
@@ -74,6 +99,8 @@ impl SplitEscrowContract {
         description: String,
         total_amount: i128,
         max_participants: Option<u32>,
+        metadata: Option<Map<String, String>>,
+        whitelist_enabled: bool,
     ) -> Result<u64, Error> {
         if !storage::has_admin(&env) {
             return Err(Error::NotInitialized);
@@ -88,6 +115,9 @@ impl SplitEscrowContract {
             return Err(Error::InvalidAmount);
         }
 
+        let metadata = metadata.unwrap_or(Map::new(&env));
+        validate_metadata(&metadata)?;
+
         let split_id = storage::get_next_split_id(&env);
         storage::bump_next_split_id(&env);
 
@@ -95,6 +125,7 @@ impl SplitEscrowContract {
             split_id,
             creator,
             description,
+            metadata,
             total_amount,
             deposited_amount: 0,
             status: SplitStatus::Pending,
@@ -102,6 +133,7 @@ impl SplitEscrowContract {
             participants: Vec::new(&env),
         };
         storage::set_split(&env, &split);
+        storage::set_whitelist_enabled(&env, split_id, whitelist_enabled);
         events::emit_split_created(&env, &split);
         Ok(split_id)
     }
@@ -120,6 +152,11 @@ impl SplitEscrowContract {
         let mut split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
         if split.status != SplitStatus::Pending {
             return Err(Error::SplitNotPending);
+        }
+        if storage::is_whitelist_enabled(&env, split_id)
+            && !storage::is_whitelisted(&env, split_id, &participant)
+        {
+            return Err(Error::Unauthorized);
         }
         if split.deposited_amount + amount > split.total_amount {
             return Err(Error::InvalidAmount);
@@ -142,6 +179,20 @@ impl SplitEscrowContract {
         }
         storage::set_split(&env, &split);
         events::emit_deposit(&env, split_id, &participant, amount);
+        Ok(())
+    }
+
+    pub fn add_to_whitelist(env: Env, split_id: u64, address: Address) -> Result<(), Error> {
+        let split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        split.creator.require_auth();
+        storage::add_to_whitelist(&env, split_id, &address);
+        Ok(())
+    }
+
+    pub fn remove_from_whitelist(env: Env, split_id: u64, address: Address) -> Result<(), Error> {
+        let split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        split.creator.require_auth();
+        storage::remove_from_whitelist(&env, split_id, &address);
         Ok(())
     }
 
@@ -181,6 +232,29 @@ impl SplitEscrowContract {
     /// `participants.len()`).
     pub fn get_escrow(env: Env, split_id: u64) -> Result<Split, Error> {
         storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)
+    }
+
+    pub fn get_metadata(env: Env, split_id: u64) -> Result<Map<String, String>, Error> {
+        let split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        Ok(split.metadata)
+    }
+
+    pub fn update_metadata(
+        env: Env,
+        split_id: u64,
+        metadata: Map<String, String>,
+    ) -> Result<(), Error> {
+        validate_metadata(&metadata)?;
+
+        let mut split = storage::get_split(&env, split_id).ok_or(Error::SplitNotFound)?;
+        split.creator.require_auth();
+        if !is_active(&split.status) {
+            return Err(Error::SplitNotActive);
+        }
+
+        split.metadata = metadata;
+        storage::set_split(&env, &split);
+        Ok(())
     }
 }
 
