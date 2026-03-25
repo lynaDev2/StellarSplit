@@ -38,9 +38,9 @@ export class PaymentReconciliationProcessor {
           `Payment ${paymentId} reached final state: ${result.newStatus}`,
         );
       }
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error(
-        `Failed to reconcile payment ${paymentId}: ${error.message}`,
+        `Failed to reconcile payment ${paymentId}: ${(error as Error).message}`,
       );
       throw error;
     }

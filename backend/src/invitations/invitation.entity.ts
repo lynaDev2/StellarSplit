@@ -27,6 +27,26 @@ export class Invitation {
   @Column({ type: 'timestamp', name: 'used_at', nullable: true })
   usedAt!: Date | null;
 
+  /** Maximum number of times this invitation can be used (default 1). */
+  @Column({ type: 'int', default: 1, name: 'max_uses' })
+  maxUses!: number;
+
+  /** Current number of times this invitation has been used. */
+  @Column({ type: 'int', default: 0, name: 'uses_count' })
+  usesCount!: number;
+
+  /** Whether this invitation can be upgraded to a registered user. */
+  @Column({ type: 'boolean', default: true, name: 'is_upgradeable' })
+  isUpgradeable!: boolean;
+
+  /** Email of the invitee (optional, for duplicate detection). */
+  @Column({ type: 'varchar', nullable: true, name: 'invitee_email' })
+  inviteeEmail?: string;
+
+  /** Token version for security (used to invalidate old tokens). */
+  @Column({ type: 'int', default: 1, name: 'token_version' })
+  tokenVersion!: number;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt!: Date;
 

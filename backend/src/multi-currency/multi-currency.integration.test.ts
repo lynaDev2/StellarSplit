@@ -10,7 +10,7 @@ import { MultiCurrencyService } from './multi-currency.service';
 import { ExchangeRateTrackerService } from './exchange-rate-tracker.service';
 import { PathPaymentService } from './path-payment.service';
 import { MultiCurrencyPayment } from './entities/multi-currency-payment.entity';
-import { Payment } from '../entities/payment.entity';
+import { Payment, PaymentProcessingStatus } from '../entities/payment.entity';
 import { Split } from '../entities/split.entity';
 import { Participant } from '../entities/participant.entity';
 import { StellarService } from '../stellar/stellar.service';
@@ -133,7 +133,7 @@ describe('Multi-Currency Integration Tests', () => {
       txHash: 'tx-hash-123',
       amount: 50,
       asset: 'XLM',
-      status: 'confirmed',
+      status: PaymentProcessingStatus.CONFIRMED,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

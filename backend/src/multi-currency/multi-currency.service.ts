@@ -10,7 +10,7 @@ import { Asset } from '@stellar/stellar-sdk';
 import { ExchangeRateTrackerService } from './exchange-rate-tracker.service';
 import { PathPaymentService } from './path-payment.service';
 import { MultiCurrencyPayment } from './entities/multi-currency-payment.entity';
-import { Payment } from '../entities/payment.entity';
+import { Payment, PaymentProcessingStatus } from '../entities/payment.entity';
 import { Split } from '../entities/split.entity';
 import { Participant } from '../entities/participant.entity';
 
@@ -168,15 +168,12 @@ export class MultiCurrencyService {
           `Payment record not found for txHash ${txHash}, creating one`,
         );
         payment = this.paymentRepository.create({
-          id: this.generateId(),
           splitId,
           participantId,
           txHash,
           amount: receivedAmount, // Use converted amount
           asset: targetAsset,
-          status: 'confirmed',
-          createdAt: new Date(),
-          updatedAt: new Date(),
+          status: PaymentProcessingStatus.CONFIRMED,
         });
         payment = await this.paymentRepository.save(payment);
       }

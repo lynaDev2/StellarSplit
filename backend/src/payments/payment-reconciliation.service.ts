@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository, LessThan, MoreThan, In } from "typeorm";
 import { Cron, CronExpression } from "@nestjs/schedule";
-import { BullQueueInject } from "@nestjs/bull";
+import { InjectQueue } from "@nestjs/bull";
 import { Queue } from "bull";
 import {
   Payment,
@@ -60,9 +60,9 @@ export class PaymentReconciliationService implements OnModuleInit {
     @InjectRepository(Split) private splitRepository: Repository<Split>,
     private readonly stellarService: StellarService,
     private readonly eventsGateway: EventsGateway,
-    @BullQueueInject("payment-reconciliation")
+    @InjectQueue("payment-reconciliation")
     private readonly reconciliationQueue: Queue,
-    @BullQueueInject("payment-settlement")
+    @InjectQueue("payment-settlement")
     private readonly settlementQueue: Queue,
     private readonly customConfig?: Partial<ReconciliationConfig>,
   ) {
@@ -127,7 +127,7 @@ export class PaymentReconciliationService implements OnModuleInit {
    * Cron job to detect and mark stale payments
    * Runs every 15 minutes to find payments that have been pending too long
    */
-  @Cron(CronExpression.EVERY_15_MINUTES)
+  @Cron('0 */15 * * * *')
   async detectStalePayments(): Promise<void> {
     this.logger.log("Starting stale payment detection");
 
