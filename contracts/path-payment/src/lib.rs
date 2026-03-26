@@ -229,13 +229,21 @@ impl PathPaymentContract {
         for i in 0..path.len() - 1 {
             let to_asset = path.get(i + 1).unwrap();
             let to_addr = to_asset.address().clone();
-            let amount_out =
-                Self::invoke_swap(&env, &router, &current_asset, &to_addr, current_amount)?;
-            if amount_out <= 0 {
-                return Err(Error::SwapFailed);
+            let amount_out = Self::invoke_swap(&env, &router, &current_asset, &to_addr, current_amount);
+            match amount_out {
+                Ok(out) if out > 0 => {
+                    current_amount = out;
+                    current_asset = to_addr;
+                }
+                Ok(out) => {
+                    events::emit_swap_failed(&env, &current_asset, &to_addr, current_amount, "zero_or_negative_output");
+                    return Err(Error::SwapFailed);
+                }
+                Err(_) => {
+                    events::emit_swap_failed(&env, &current_asset, &to_addr, current_amount, "invoke_error");
+                    return Err(Error::SwapFailed);
+                }
             }
-            current_amount = amount_out;
-            current_asset = to_addr;
         }
 
         if current_amount < min_dest {

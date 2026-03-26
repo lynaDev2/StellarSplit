@@ -40,3 +40,17 @@ pub fn emit_pair_registered(env: &Env, from: &Address, to: &Address) {
     env.events()
         .publish((symbol_short!("pair_reg"),), (from.clone(), to.clone()));
 }
+
+/// Emit an event when a swap fails during path payment execution.
+pub fn emit_swap_failed(
+    env: &Env,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+    reason: &str,
+) {
+    env.events().publish(
+        (symbol_short!("swap_fail"),),
+        (from.clone(), to.clone(), amount, String::from_str(env, reason)),
+    );
+}

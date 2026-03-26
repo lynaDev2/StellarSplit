@@ -1,4 +1,39 @@
-//! Tests for path-payment contract: path finding, conversion rate, execute with slippage.
+/// Tests for path-payment contract: path finding, conversion rate, execute with slippage.
+
+// ========== Swap Failure Event Test ==========
+
+#[test]
+fn test_swap_failure_event_emitted() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::String;
+
+    // Setup contract and environment
+    let (env, admin, token_a, token_b, _contract_id, client, _token_client, stellar_token) = setup_with_tokens();
+    client.initialize(&admin);
+    client.set_rate(&Asset(token_a.clone()), &Asset(token_b.clone()), &10_000_000);
+    let caller = Address::generate(&env);
+    env.mock_all_auths();
+    stellar_token.mint(&caller, &500_0000000i128);
+    let mut path = Vec::new(&env);
+    path.push_back(Asset(token_a.clone()));
+    path.push_back(Asset(token_b.clone()));
+    let split_id = String::from_str(&env, "split-swapfail");
+    let amount = 100_0000000i128;
+
+    // No router set, so swap will fail
+    let res = client.try_execute_path_payment(&caller, &split_id, &path, &amount, &0u32);
+    assert!(res.is_err());
+
+    // Check that swap_fail event was emitted
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        // Events are (contract_id, topics, data)
+        let (_contract_id, topics, data) = e;
+        topics.contains(&soroban_sdk::symbol_short!("swap_fail")) && data.len() == 4
+    });
+    assert!(found, "swap_fail event should be emitted on swap failure");
+}
+
 
 extern crate std;
 
