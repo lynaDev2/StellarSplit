@@ -29,6 +29,9 @@ interface DecodedCursor {
  * I chose PostgreSQL's built-in FTS over external solutions like Elasticsearch
  * because it integrates seamlessly with our existing TypeORM setup and 
  * provides sufficient performance for this application's scale.
+ * 
+ * Features are checked at startup with graceful degradation when extensions
+ * or indexes are unavailable.
  */
 @Injectable()
 export class SearchService {
@@ -41,6 +44,13 @@ export class SearchService {
   // Minimum similarity threshold for fuzzy matching (0-1 scale)
   private readonly FUZZY_THRESHOLD = 0.3;
 
+  // Feature detection for graceful degradation
+  private features = {
+    fts: false,     // Full-text search (to_tsvector/to_tsquery)
+    trgm: false,     // Trigram similarity (pg_trgm extension)
+    materializedView: false,
+  };
+
   constructor(
     @InjectRepository(Split)
     private readonly splitRepository: Repository<Split>,
@@ -49,6 +59,74 @@ export class SearchService {
     @InjectRepository(Participant)
     private readonly participantRepository: Repository<Participant>,
   ) {}
+
+  /**
+   * Initialize feature detection
+   * Call this at module startup to determine available features
+   */
+  async initializeFeatures(): Promise<void> {
+    try {
+      // Check for FTS capability
+      await this.checkFtsCapability();
+      
+      // Check for trigram capability
+      await this.checkTrgmCapability();
+      
+      // Check for materialized view
+      await this.checkMaterializedView();
+      
+      this.logger.log('Search features initialized', this.features);
+    } catch (error) {
+      this.logger.warn('Failed to initialize search features, using fallback mode', error);
+    }
+  }
+
+  private async checkFtsCapability(): Promise<void> {
+    try {
+      await this.splitRepository.query(`
+        SELECT to_tsvector('english', 'test') @@ to_tsquery('english', 'test')
+      `);
+      this.features.fts = true;
+    } catch (error) {
+      this.logger.warn('FTS not available, falling back to ILIKE search');
+    }
+  }
+
+  private async checkTrgmCapability(): Promise<void> {
+    try {
+      await this.splitRepository.query(`
+        SELECT similarity('test', 'testing')
+      `);
+      this.features.trgm = true;
+    } catch (error) {
+      this.logger.warn('Trigram similarity not available, falling back to basic LIKE');
+    }
+  }
+
+  private async checkMaterializedView(): Promise<void> {
+    try {
+      await this.splitRepository.query(`
+        SELECT * FROM mv_split_search_data LIMIT 1
+      `);
+      this.features.materializedView = true;
+    } catch (error) {
+      this.logger.warn('Materialized view not available');
+    }
+  }
+
+  /**
+   * Get feature availability for health checks
+   */
+  getFeatures(): Record<string, boolean> {
+    return { ...this.features };
+  }
+
+  /**
+   * Check if search is operational
+   */
+  isOperational(): boolean {
+    return this.features.fts || this.features.trgm;
+  }
 
   /**
    * Main search entry point
@@ -114,11 +192,18 @@ export class SearchService {
   /**
    * Apply PostgreSQL full-text search using to_tsvector and to_tsquery
    * I'm also adding trigram similarity for fuzzy matching on typos
+   * 
+   * Falls back to ILIKE-based search when extensions are unavailable
    */
   private applyFullTextSearch(
     queryBuilder: SelectQueryBuilder<Split>,
     searchQuery: string,
   ): SelectQueryBuilder<Split> {
+    // Use fallback search if FTS extension is not available
+    if (!this.features.fts && !this.features.trgm) {
+      return this.applyFallbackSearch(queryBuilder, searchQuery);
+    }
+
     // Convert search query to tsquery format
     // Using plainto_tsquery for simple queries, websearch_to_tsquery for complex ones
     const tsQuery = this.buildTsQuery(searchQuery);
@@ -146,6 +231,30 @@ export class SearchService {
       COALESCE(ts_rank(to_tsvector('english', COALESCE(split.description, '')), to_tsquery('english', :tsQuery)), 0) +
       COALESCE(similarity(COALESCE(split.description, ''), :rawQuery), 0)
     )`, 'search_score');
+
+    return queryBuilder;
+  }
+
+  /**
+   * Fallback search using ILIKE when extensions are unavailable
+   */
+  private applyFallbackSearch(
+    queryBuilder: SelectQueryBuilder<Split>,
+    searchQuery: string,
+  ): SelectQueryBuilder<Split> {
+    const terms = searchQuery.toLowerCase().split(/\s+/).filter(t => t.length > 0);
+    const likePattern = `%${searchQuery.toLowerCase()}%`;
+
+    queryBuilder.andWhere(`(
+      LOWER(split.description) LIKE :likePattern
+      OR EXISTS (
+        SELECT 1 FROM items i 
+        WHERE i."splitId" = split.id 
+        AND LOWER(i.name) LIKE :likePattern
+      )
+    )`, { 
+      likePattern 
+    });
 
     return queryBuilder;
   }
