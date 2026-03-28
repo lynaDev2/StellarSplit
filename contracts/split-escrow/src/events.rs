@@ -6,7 +6,6 @@ pub fn emit_initialized(env: &Env, admin: &Address) {
     env.events().publish(("init", "admin"), admin.clone());
 }
 
-
 pub fn emit_split_created(env: &Env, split: &Split) {
     env.events().publish(
         ("created", "split_id", "creator"),

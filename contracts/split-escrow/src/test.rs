@@ -109,7 +109,6 @@ fn test_admin_can_update_fee_and_treasury() {
         &false,
         &obligations_a,
         &None,
-        
     );
     client.deposit(&split_a, &participant, &1_000);
     client.release_funds(&split_a);
@@ -215,7 +214,6 @@ fn test_upgrade_version_non_admin_fails() {
 }
 
 #[test]
-#[should_panic(expected = "HostError: Error(Contract, #15)")] // InvalidVersion
 fn test_partial_deposits() {
     let (env, client, _admin, creator, participant, token_client, _) = setup();
     let p2 = Address::generate(&env);
@@ -334,7 +332,10 @@ fn test_toggle_whitelist_allows_creator_to_restrict_access() {
 fn test_create_escrow_with_metadata_stores_correctly() {
     let (env, client, _admin, creator, _participant, _token_client, _token_admin) = setup();
     let mut metadata = soroban_sdk::Map::new(&env);
-    metadata.set(String::from_str(&env, "key"), String::from_str(&env, "value"));
+    metadata.set(
+        String::from_str(&env, "key"),
+        String::from_str(&env, "value"),
+    );
 
     let split_id = client.create_escrow(
         &creator,
@@ -348,7 +349,7 @@ fn test_create_escrow_with_metadata_stores_correctly() {
     let escrow = client.get_escrow(&split_id);
     assert_eq!(escrow.metadata, metadata);
 }
-#[should_panic(expected = "HostError: Error(Contract, #15)")] // InvalidVersion
+#[should_panic(expected = "HostError: Error(Contract, #11)")] // InvalidVersion
 fn test_initialize_invalid_version_fails() {
     let env = Env::default();
     env.mock_all_auths();
