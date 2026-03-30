@@ -7,6 +7,8 @@ import { Participant } from '../../entities/participant.entity';
 import { Receipt } from '../../receipts/entities/receipt.entity';
 import { OcrService } from '../../ocr/ocr.service';
 import { SplitCalculationService } from './split-calculation.service';
+import { FraudDetectionService } from '../../fraud-detection/fraud-detection.service';
+import { AnalyzeSplitRequestDto } from '../../fraud-detection/dto/analyze-split.dto';
 import { 
   CreateSplitDto, 
   UpdateSplitDto, 
@@ -28,6 +30,7 @@ export class SplitsService {
     private readonly receiptRepository: Repository<Receipt>,
     private readonly ocrService: OcrService,
     private readonly splitCalculationService: SplitCalculationService,
+    private readonly fraudDetectionService: FraudDetectionService,
   ) {}
 
   /**
